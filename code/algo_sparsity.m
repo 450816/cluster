@@ -1,0 +1,143 @@
+function labels = algo_sparsity_cvx(delays, powers)
+    % -------------------------------------------------------------------------
+    % 算法名称: Sparsity-based Clustering (基于稀疏度的聚类算法)
+    % 参考文献: R. He et al., "On the Clustering of Radio Channel Impulse 
+    %          Responses Using Sparsity-Based Methods", IEEE TAP, 2016.
+    % -------------------------------------------------------------------------
+    % 输入:
+    %   delays: 多径时延 (ns)
+    %   powers: 多径功率 (线性值, Watt)
+    % 输出:
+    %   labels: 每个多径点所属的簇标签 (0表示噪声)
+    % -------------------------------------------------------------------------
+
+    %% --- Step 1: 数据预处理 (Data Preparation) ---
+    % 对应论文 Section II-B: 将功率转换为对数域 (dB)，因为 S-V 模型在 dB 域呈现分段线性特征。
+    [d_sort, idx_sort] = sort(delays);
+    p_lin = powers(idx_sort);
+    y = 10*log10(p_lin); 
+    N = length(y);
+    
+    %% --- Step 2: 构建差分算子 (Finite-difference Operators) ---
+    % 对应论文 Section III 公式 (5) 和 (6)
+    % Omega 算子用于计算信号的二阶差分，从而检测斜率的变化（即簇的起止点）。
+    
+    % 一阶差分矩阵 D1 (计算斜率)
+    e = ones(N, 1);
+    D1 = spdiags([-e e], 0:1, N-1, N);
+    
+    % 二阶差分矩阵 D2 (计算斜率变化率)
+    e2 = ones(N-1, 1);
+    D2 = spdiags([e2 -e2], 0:1, N-2, N-1);
+    
+    % 组合算子 Omega = D2 * D1 (对应公式 4 中的 Omega2 * Omega1)
+    Omega = D2 * D1; 
+
+    %% --- Step 3: 迭代加权 L1 最小化 (Reweighted l1 Minimization) ---
+    % 对应论文 Section IV-A: 求解稀疏优化问题以恢复去噪后的信号 P_hat
+    
+    % 参数设置:
+    num_iter = 3;   % 论文提到通常 3 次迭代即可收敛 (IV-A, Step 4)
+    weights = ones(N-2, 1); % 初始化权重 w^(0) = 1 (IV-A, Step 1)
+    epsilon = 0.05; % 稳定性参数 epsilon (Eq. 9)
+    
+    % 正则化参数 Lambda (Eq. 4)
+    
+    % Lambda 需要相应设大以保持与稀疏项的平衡。经验值设为 20。越大越欠拟合
+    lambda = 20; 
+    
+    try
+        for k = 1:num_iter
+            cvx_begin quiet
+                variable P_hat(N)
+                
+                % 目标函数 (Strict Implementation of Eq. 4):
+                % min ||y - P_hat||_2^2 + lambda * ||W * Omega * P_hat||_0
+                % 使用 L1 范数松弛 L0 范数，并使用 sum_square 严格复现平方误差。
+                minimize( sum_square(y - P_hat) + lambda * norm(weights .* (Omega * P_hat), 1) )
+            cvx_end
+            
+            % 更新权重 (Eq. 9): w^(m+1) = 1 / (|Omega*P_hat| + epsilon)
+            % 这一步增强了稀疏性，迫使非簇头位置的二阶差分趋近于零。
+            diff_val = abs(Omega * P_hat);
+            weights = 1 ./ (diff_val + epsilon);
+        end
+    catch
+        error('CVX solver failed. Please ensure CVX is installed.');
+    end
+    
+    %% --- Step 4: 簇识别 (Cluster Identification) ---
+    % 对应论文 Section IV-B
+    
+    % 计算转折点指标 Phi (Eq. 10): Phi = Omega * P_hat
+    % Phi 的峰值代表了功率衰减趋势发生突变的位置（即簇头）。
+    Phi = Omega * P_hat; 
+    
+    % 门限设定 (Eq. 11 & 12):
+    % 论文建议 C_th = 1。这里使用 "1.0 * std(Phi)" 作为自适应基准，
+    % 含义是：超过背景噪声波动 1 倍标准差的突变被视为潜在簇头。
+    
+    base_th = 1.0;
+    %base_th = 1.0 * std(Phi); 
+    onsets = [1]; % 默认第一个点为第一个簇的起点
+    
+    for i = 1:length(Phi)
+        % 索引映射：差分操作导致 Phi 的长度比原始数据少 2，索引需 +1 修正
+        idx_data = i + 1; 
+        
+        % 分段门限逻辑 (严格复现 Eq. 12):
+        % - 前 30% 延迟区域使用高门限 (C_th)
+        % - 后 70% 延迟区域使用低门限 (0.5 * C_th)，以检测尾部的弱簇
+        if idx_data <= 0.3 * N
+            current_th = base_th;      
+        else
+            current_th = 0.5 * base_th; 
+        end
+        
+        % 判决条件 (Eq. 11): Phi > Threshold
+        if Phi(i) > current_th
+            % 局部极大值检测 (Local Peak Detection):
+            % 确保找到的是峰值中心，而不是峰值的侧边
+            is_local_max = true;
+            if i > 1 && Phi(i) < Phi(i-1), is_local_max = false; end
+            if i < length(Phi) && Phi(i) < Phi(i+1), is_local_max = false; end
+            
+            if is_local_max
+                % 物理约束 (非论文公式，但为必要的物理合理性检查):
+                % 两个簇头之间的时间间隔不应太短 (如 < 8ns)，避免算法对单一宽峰产生抖动。
+                if delays(idx_sort(idx_data)) - delays(idx_sort(onsets(end))) > 8
+                    onsets = [onsets; idx_data];
+                end
+            end
+        end
+    end
+    
+    %% --- Step 5: 标签生成 (Label Generation) ---
+    % 根据找到的簇头 (onsets) 对时域进行切片
+    labels_sorted = zeros(N, 1);
+    num_clusters = length(onsets);
+    
+    for k = 1:num_clusters
+        idx_start = onsets(k);
+        if k < num_clusters
+            idx_end = onsets(k+1) - 1;
+        else
+            idx_end = N;
+        end
+        
+        % 将该区间内的所有点归为一个簇
+        labels_sorted(idx_start:idx_end) = k;
+    end
+    
+    % [可选步骤] 噪声过滤:
+    % 移除点数过少 (例如 < 3个点) 的簇，通常是末端的孤立噪声
+    for k = 1:num_clusters
+        if sum(labels_sorted == k) < 3
+            labels_sorted(labels_sorted == k) = 0;
+        end
+    end
+    
+    %% --- Step 6: 还原顺序 (Restore Order) ---
+    labels = zeros(N, 1);
+    labels(idx_sort) = labels_sorted;
+end
